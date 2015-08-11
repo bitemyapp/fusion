@@ -15,7 +15,7 @@ module Fusion
     , toListS, lazyToListS, runEffect, emptyStream
     , bracketS, next
     -- * StreamList
-    , ListT(..), concat
+    , ListT(..), concatL
     -- * Pipes
     , Producer, Pipe, Consumer
     , each, mapP
@@ -60,7 +60,7 @@ instance Functor m => Functor (Stream a m) where
     fmap f (Stream k m) = Stream (fmap (fmap f) . k) m
     {-# INLINE fmap #-}
 
-instance Monad m => Applicative (Stream a m) where
+instance (Monad m, Applicative m) => Applicative (Stream a m) where
     pure x = Stream (pure . Done) (pure x)
     {-# INLINE pure #-}
     sf <*> sx = Stream (pure . Done) (runEffect sf <*> runEffect sx)
@@ -95,8 +95,8 @@ concatS (Stream xs i) =
     go (Just (Stream ys j)) e@(Yield s _) = go' `liftM` (j >>= ys)
       where
         go' (Done _)    = Skip (Left s)
-        go' (Skip s')   = Skip (Right (e, Stream ys (pure s')))
-        go' (Yield s' a) = Yield (Right (e, Stream ys (pure s'))) a
+        go' (Skip s')   = Skip (Right (e, Stream ys (return s')))
+        go' (Yield s' a) = Yield (Right (e, Stream ys (return s'))) a
 {-# SPECIALIZE concatS :: Stream (Stream a IO r) IO r -> Stream a IO r #-}
 
 fromList :: Foldable f => Applicative m => f a -> Stream a m ()
@@ -107,7 +107,7 @@ fromList = Stream (\case []     -> pure $ Done ()
 fromListM :: (Monad m, Foldable f) => m (f a) -> Stream a m ()
 fromListM xs = Stream (\case []     -> return $ Done ()
                              (y:ys) -> return $ Yield ys y)
-                      (toList <$> xs)
+                      (toList `liftM` xs)
 {-# INLINE fromListM #-}
 
 runEffect :: Monad m => Stream a m r -> m r
@@ -134,7 +134,7 @@ lazyToListS (Stream f i) = i >>= f >>= go
     go (Yield s a) = f s >>= liftM (a:) . unsafeInterleaveIO . go
 {-# INLINE lazyToListS #-}
 
-emptyStream :: Monad m => Stream Void m ()
+emptyStream :: (Monad m, Applicative m) => Stream Void m ()
 emptyStream = pure ()
 {-# INLINE emptyStream #-}
 
@@ -144,7 +144,7 @@ bracketS :: (Monad m, MonadMask m, MonadSafe m)
          -> (forall r. s -> (a -> s -> m r) -> (s -> m r) -> m r -> m r)
          -> Stream a m ()
 bracketS i f step = Stream go $ mask $ \_unmask -> do
-    s <- liftBase i
+    s   <- liftBase i
     key <- register (f s)
     return (s, key)
   where
@@ -152,6 +152,7 @@ bracketS i f step = Stream go $ mask $ \_unmask -> do
         step s (\a s' -> return $ Yield (s', key) a)
                (\s'   -> return $ Skip (s', key))
                (release key >> (const (Done ()) `liftM` liftBase (f s)))
+{-
 {-# SPECIALIZE bracketS
       :: IO s
       -> (s -> IO ())
@@ -160,6 +161,7 @@ bracketS i f step = Stream go $ mask $ \_unmask -> do
            -> SafeT IO r
            -> SafeT IO r)
       -> Stream a (SafeT IO) () #-}
+-}
 
 next :: Monad m => Stream a m r -> m (Either r (a, Stream a m r))
 next (Stream xs i) = do
@@ -179,20 +181,20 @@ instance Functor m => Functor (ListT m) where
     fmap f (ListT s) = ListT $ mapS f s
     {-# INLINE fmap #-}
 
-instance Monad m => Applicative (ListT m) where
+instance (Monad m, Applicative m) => Applicative (ListT m) where
     pure = return
     {-# INLINE pure #-}
     (<*>) = ap
     {-# INLINE (<*>) #-}
 
-instance Monad m => Monad (ListT m) where
+instance (Monad m, Applicative m) => Monad (ListT m) where
     return x = ListT $ fromList [x]
     {-# INLINE return #-}
     m >>= f = concatL $ fmap f m
     {-# INLINE (>>=) #-}
 
-concatL :: Monad m => ListT m (ListT m a) -> ListT m a
-concatL = ListT . concatS . getListT . fmap getListT
+concatL :: (Monad m, Applicative m) => ListT m (ListT m a) -> ListT m a
+concatL = ListT . concatS . getListT . liftM getListT
 {-# INLINE concatL #-}
 
 -- Pipes
@@ -201,10 +203,10 @@ type Producer   b m r = Stream b m r
 type Pipe     a b m r = Stream a m () -> Stream b m r
 type Consumer a   m r = Stream a m () -> m r
 
-each :: (Monad m, Foldable f) => f a -> Producer a m ()
+each :: (Applicative m, Foldable f) => f a -> Producer a m ()
 each = fromList
 {-# INLINE each #-}
 
-mapP :: Monad m => (a -> b) -> Pipe a b m ()
-mapP f = getListT . fmap f . ListT
+mapP :: (Monad m, Applicative m) => (a -> b) -> Pipe a b m ()
+mapP f = getListT . liftM f . ListT
 {-# INLINE mapP #-}

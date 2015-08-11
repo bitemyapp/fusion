@@ -1,5 +1,5 @@
 name:                fusion
-version:             0.1.0
+version:             0.1.1
 synopsis:            Effectful streaming library based on shortcut fusion techniques
 description:         Effectful streaming library based on shortcut fusion techniques
 homepage:            https://github.com/jwiegley/fusion
@@ -16,9 +16,10 @@ library
   exposed-modules:     Fusion
   other-extensions:    DeriveFunctor, LambdaCase, RankNTypes, GADTs
   build-depends:       
-      base         >=4.8 && <4.9
-    , transformers >=0.4 && <0.5
+      base         >=4.7 && <5
+    , transformers >=0.3 && <0.5
     , pipes-safe   >=2.2 && <3
+    , void         >=0.7 && <1
   default-language:    Haskell2010
 
 Test-suite doctests
