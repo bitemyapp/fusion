@@ -16,8 +16,9 @@ library
   exposed-modules:     Fusion
   other-extensions:    DeriveFunctor, LambdaCase, RankNTypes, GADTs
   build-depends:       
-      base >=4.8 && <4.9
+      base         >=4.8 && <4.9
     , transformers >=0.4 && <0.5
+    , pipes-safe   >=2.2 && <3
   default-language:    Haskell2010
 
 Test-suite doctests
