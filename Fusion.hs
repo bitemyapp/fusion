@@ -16,12 +16,14 @@ module Fusion
     -- * StepList
     , StepList(..)
     -- * Stream
-    , Stream(..), map, filter, drop, concat, fromList, fromListM
+    , Stream(..), map, filter, drop, concat, lines
+    , fromList, fromListM
     , runStream, runStream', bindStream, applyStream, stepStream
     , foldlStream, foldlStreamM
     , foldrStream, foldrStreamM, lazyFoldrStreamIO
-    , toList, lazyToListIO
-    , emptyStream, bracket, next
+    , toListM, lazyToListIO
+    , emptyStream, next
+    , bracket, streamFile
     -- * StreamList
     , ListT(..), concatL
     -- * Pipes
@@ -33,13 +35,20 @@ module Fusion
 
 import           Control.Applicative
 import           Control.Monad
+import           Control.Monad.IO.Class
 import           Control.Monad.Trans.Class
+import           Data.ByteString (ByteString)
+import qualified Data.ByteString as B
 import qualified Data.Foldable as F
 import           Data.Functor.Identity
+import           Data.Text (Text)
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as T
 import           Data.Void
 import           GHC.Exts hiding (fromList, toList)
-import           Pipes.Safe (MonadSafe(..), MonadMask(..))
-import           Prelude hiding (map, concat, filter, drop)
+import           Pipes.Safe (SafeT, MonadSafe(..), MonadMask(..))
+import           Prelude hiding (map, concat, filter, drop, lines)
+import           System.IO
 import           System.IO.Unsafe
 
 #define PHASE_FUSED [1]
@@ -70,7 +79,7 @@ instance Functor (StepList s r) where
 data Stream a m r = forall s. Stream (s -> m (Step s a r)) s
 
 instance Show a => Show (Stream a Identity r) where
-    show xs = "Stream " ++ show (runIdentity (toList xs))
+    show xs = "Stream " ++ show (runIdentity (toListM xs))
 
 instance Functor m => Functor (Stream a m) where
     {-# SPECIALIZE instance Functor (Stream a IO) #-}
@@ -137,7 +146,7 @@ filter p (Stream step i) = Stream step' i
 
 data Split = Pass !Int# | Keep
 
-drop :: Applicative m => Int -> Stream a m r -> Stream a m ()
+drop :: Applicative m => Int -> Stream a m r -> Stream a m r
 drop (I# n) (Stream step i) = Stream step' (i, Pass n)
   where
     {-# INLINE_INNER step' #-}
@@ -145,12 +154,12 @@ drop (I# n) (Stream step i) = Stream step' (i, Pass n)
     step' (s, Pass n') = step s <&> \case
         Yield s' _ -> Skip (s', Pass (n' -# 1#))
         Skip  s'   -> Skip (s', Pass n')
-        Done  _    -> Done ()
+        Done  r    -> Done r
 
     step' (s, Keep) = step s <&> \case
         Yield s' x -> Yield (s', Keep) x
         Skip  s'   -> Skip  (s', Keep)
-        Done _     -> Done ()
+        Done r     -> Done r
 {-# INLINE_FUSED drop #-}
 
 concat :: Monad m => Stream (Stream a m r) m r -> Stream a m r
@@ -167,6 +176,39 @@ concat (Stream step i) = Stream step' (Left i)
         Skip j'    -> Skip (Right (s, Stream inner j'))
         Yield j' a -> Yield (Right (s, Stream inner j')) a) (inner j)
 {-# INLINE_FUSED concat #-}
+
+-- decodeUtf8 :: Applicative m => Stream ByteString m r -> Stream Text m ()
+-- decodeUtf8 = Stream step' (i, Pass n)
+
+lines :: Applicative m => Stream Text m r -> Stream Text m r
+lines (Stream step i) = Stream step' (Left (i, id))
+  where
+    -- Right means we have pending lines to emit, followed by either the next
+    -- state, or the end.
+    step' (Right (n, x:xs))     = pure $ Yield (Right (n, xs)) x
+    step' (Right (Left n, []))  = step' (Left n)
+    step' (Right (Right r, [])) = pure $ Done r
+
+    -- Left means we want to read more lines, gathering up the ends in case
+    -- they form a line with the next chunk
+    step' (Left (s, prev)) = step s <&> \case
+        Done r     -> case prev [] of
+            []     -> Done r
+            (x:xs) -> Yield (Right (Right r, xs)) x
+        Skip s'    -> Skip (Left (s', prev))
+        Yield s' a -> case T.lines a of
+            []     -> Skip (Left (s', prev))
+            [x]    -> Skip (Left (s', prev . (x:)))
+            -- This case is particularly complicated because we need to:
+            --  1. Emit the known line 'x' now, prepending any remainder
+            --     from previous reads (prev)
+            --  2. Queue remaining known lines (init xs) for yielding after
+            --  3. Preserve the remainder for the next read (last xs)
+            --  4. Indicate the next state to read from after we've flushed
+            --     everything that was queued (s')
+            (x:xs) -> Yield (Right (Left (s', (last xs:)), init xs))
+                            (T.concat (prev [x]))
+{-# INLINE_FUSED lines #-}
 
 fromList :: (F.Foldable f, Applicative m) => f a -> Stream a m ()
 fromList = Stream (pure . step) . F.toList
@@ -258,15 +300,15 @@ lazyFoldrStreamIO f w (Stream step i) = step' i
         Yield s' a -> f a (unsafeInterleaveIO (step' s'))
 {-# INLINE_FUSED lazyFoldrStreamIO #-}
 
-toList :: Monad m => Stream a m r -> m [a]
-toList (Stream step i) = step' i id
+toListM :: Monad m => Stream a m r -> m [a]
+toListM (Stream step i) = step' i id
   where
     {-# INLINE_INNER step' #-}
     step' s acc = step s >>= \case
         Done _     -> return $ acc []
         Skip s'    -> step' s' acc
         Yield s' a -> step' s' (acc . (a:))
-{-# INLINE toList #-}
+{-# INLINE toListM #-}
 
 lazyToListIO :: Stream a IO r -> IO [a]
 lazyToListIO (Stream step i) = step' i
@@ -301,6 +343,18 @@ bracket i f step = Stream step' $ mask $ \unmask -> do
               release key
               return $ Done ())
 {-# INLINE_FUSED bracket #-}
+
+streamFile :: (MonadIO m, MonadMask (Base m), MonadSafe m)
+           => FilePath -> Stream ByteString m ()
+streamFile path = bracket
+    (liftIO $ openFile path ReadMode)
+    (liftIO . hClose)
+    (\h yield _skip done -> do
+          b <- liftIO $ hIsEOF h
+          if b
+              then done
+              else yield h =<< liftIO (B.hGetSome h 8192))
+{-# SPECIALIZE streamFile :: FilePath -> Stream ByteString (SafeT IO) () #-}
 
 next :: Monad m => Stream a m r -> m (Either r (a, Stream a m r))
 next (Stream step i) = step' i
