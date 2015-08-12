@@ -81,6 +81,7 @@ instance MonadTrans (Stream a) where
 
 (<&>) :: Functor f => f a -> (a -> b) -> f b
 (<&>) = flip (<$>)
+{-# INLINE (<&>) #-}
 
 -- | Map over the values produced by a stream.
 --
@@ -107,19 +108,21 @@ filterS p (Stream step i) = Stream step' i
                    | otherwise -> Skip s'
 {-# INLINE_FUSED filterS #-}
 
-dropS :: Functor m => Int -> Stream a m r -> Stream a m ()
-dropS n (Stream step i) = Stream step' (i,n)
+dropS :: Monad m => Int -> Stream a m r -> Stream a m ()
+dropS n (Stream step i) = Stream step' (i, Just n)
   where
     {-# INLINE_INNER step' #-}
-    step' (s,0) = step s <&> \case
-        Done _     -> Done ()
-        Skip s'    -> Skip (s',0)
-        Yield s' a -> Yield (s',0) a
+    step' (s, Just n')
+        | n' > 0 = step s <&> \case
+            Yield s' _ -> Skip (s', Just (n'-1))
+            Skip  s'   -> Skip (s', Just n')
+            Done  _    -> Done ()
+        | otherwise = return $ Skip (s, Nothing)
 
-    step' (s,n') = step s <&> \case
+    step' (s, Nothing) = step s <&> \case
+        Yield s' x -> Yield (s', Nothing) x
+        Skip  s'   -> Skip  (s', Nothing)
         Done _     -> Done ()
-        Skip s'    -> Skip (s',n')
-        Yield s' a -> Yield (s',n'-1) a
 {-# INLINE_FUSED dropS #-}
 
 concatS :: Monad m => Stream (Stream a m r) m r -> Stream a m r
@@ -161,7 +164,7 @@ runStream (Stream step i) = step' i
         Done r     -> return r
         Skip s'    -> step' s'
         Yield s' _ -> step' s'
-{-# INLINE_FUSED runStream #-}
+{-# INLINE runStream #-}
 
 runStream_ :: Monad m => Stream Void m r -> m r
 runStream_ (Stream step i) = step' i
@@ -171,7 +174,7 @@ runStream_ (Stream step i) = step' i
         Done r    -> return r
         Skip s'   -> step' s'
         Yield _ a -> absurd a
-{-# INLINE_FUSED runStream_ #-}
+{-# INLINE runStream_ #-}
 
 toListS :: Monad m => Stream a m r -> m [a]
 toListS (Stream step i) = step' i
@@ -181,7 +184,7 @@ toListS (Stream step i) = step' i
         Done _     -> return []
         Skip s'    -> step' s'
         Yield s' a -> liftM (a:) (step' s')
-{-# INLINE_FUSED toListS #-}
+{-# INLINE toListS #-}
 
 lazyToListS :: Stream a IO r -> IO [a]
 lazyToListS (Stream step i) = step' i
@@ -191,7 +194,7 @@ lazyToListS (Stream step i) = step' i
         Done _     -> return []
         Skip s'    -> step' s'
         Yield s' a -> liftM (a:) (unsafeInterleaveIO (step' s'))
-{-# INLINE_FUSED lazyToListS #-}
+{-# INLINE lazyToListS #-}
 
 emptyStream :: (Monad m, Applicative m) => Stream Void m ()
 emptyStream = pure ()
@@ -225,7 +228,7 @@ next (Stream step i) = step' i
         Done r     -> return $ Left r
         Skip s'    -> step' s'
         Yield s' a -> return $ Right (a, Stream step s')
-{-# INLINE_FUSED next #-}
+{-# INLINE next #-}
 
 -- ListT
 
