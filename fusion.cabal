@@ -1,5 +1,5 @@
 name:                fusion
-version:             0.1.2
+version:             0.2.0
 synopsis:            Effectful streaming library based on shortcut fusion techniques
 description:         Effectful streaming library based on shortcut fusion techniques
 homepage:            https://github.com/jwiegley/fusion
@@ -15,7 +15,7 @@ cabal-version:       >=1.10
 library
   exposed-modules:     Fusion
   other-extensions:    DeriveFunctor, LambdaCase, RankNTypes, GADTs
-  ghc-options:         -O2
+  ghc-options:         -O2 -fexpose-all-unfoldings -fmax-simplifier-iterations=20
   build-depends:       
       base         >=4.7 && <5
     , transformers >=0.3 && <0.5
