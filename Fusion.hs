@@ -1,8 +1,11 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE TupleSections #-}
 
 module Fusion
     (
@@ -11,9 +14,9 @@ module Fusion
     -- * StepList
     , StepList(..)
     -- * Stream
-    , Stream(..), mapS, concatS, fromList, fromListM
-    , toListS, lazyToListS, runEffect, emptyStream
-    , bracketS, next
+    , Stream(..), mapS, filterS, dropS, concatS, fromList, fromListM
+    , toListS, lazyToListS, runStream, runStream_
+    , emptyStream, bracketS, next
     -- * StreamList
     , ListT(..), concatL
     -- * Pipes
@@ -30,6 +33,12 @@ import Data.Functor.Identity
 import Data.Void
 import Pipes.Safe
 import System.IO.Unsafe
+
+#define PHASE_FUSED [1]
+#define PHASE_INNER [0]
+
+#define INLINE_FUSED INLINE PHASE_FUSED
+#define INLINE_INNER INLINE PHASE_INNER
 
 -- Step
 
@@ -51,127 +60,172 @@ instance Functor (StepList s r) where
 -- Stream
 
 data Stream a m r where
-    Stream :: (s -> m (Step s a r)) -> m s -> Stream a m r
+    Stream :: (s -> m (Step s a r)) -> s -> Stream a m r
 
 instance Show a => Show (Stream a Identity r) where
     show xs = "Stream " ++ show (runIdentity (toListS xs))
 
 instance Functor m => Functor (Stream a m) where
     fmap f (Stream k m) = Stream (fmap (fmap f) . k) m
-    {-# INLINE fmap #-}
+    {-# INLINE_FUSED fmap #-}
 
 instance (Monad m, Applicative m) => Applicative (Stream a m) where
-    pure x = Stream (pure . Done) (pure x)
-    {-# INLINE pure #-}
-    sf <*> sx = Stream (pure . Done) (runEffect sf <*> runEffect sx)
-    {-# INLINE (<*>) #-}
+    pure = Stream (pure . Done)
+    {-# INLINE_FUSED pure #-}
+    sf <*> sx = Stream (\() -> Done <$> (runStream sf <*> runStream sx)) ()
+    {-# INLINE_FUSED (<*>) #-}
 
 instance MonadTrans (Stream a) where
-    lift = Stream (return . Done)
-    {-# INLINE lift #-}
+    lift = Stream (Done `liftM`)
+    {-# INLINE_FUSED lift #-}
+
+(<&>) :: Functor f => f a -> (a -> b) -> f b
+(<&>) = flip (<$>)
 
 -- | Map over the values produced by a stream.
 --
 -- >>> mapS (+1) (fromList [1..3]) :: Stream Int Identity ()
 -- Stream [2,3,4]
 mapS :: Functor m => (a -> b) -> Stream a m r -> Stream b m r
-mapS f (Stream s i) = Stream (fmap go . s) i
+mapS f (Stream step i) = Stream step' i
   where
-    go (Done r)     = Done r
-    go (Skip s')    = Skip s'
-    go (Yield s' a) = Yield s' (f a)
-{-# INLINE mapS #-}
+    {-# INLINE_INNER step' #-}
+    step' s = step s <&> \case
+        Done r     -> Done r
+        Skip s'    -> Skip s'
+        Yield s' a -> Yield s' (f a)
+{-# INLINE_FUSED mapS #-}
+
+filterS :: Functor m => (a -> Bool) -> Stream a m r -> Stream a m r
+filterS p (Stream step i) = Stream step' i
+  where
+    {-# INLINE_INNER step' #-}
+    step' s = step s <&> \case
+        Done r     -> Done r
+        Skip s'    -> Skip s'
+        Yield s' a | p a -> Yield s' a
+                   | otherwise -> Skip s'
+{-# INLINE_FUSED filterS #-}
+
+dropS :: Functor m => Int -> Stream a m r -> Stream a m ()
+dropS n (Stream step i) = Stream step' (i,n)
+  where
+    {-# INLINE_INNER step' #-}
+    step' (s,0) = step s <&> \case
+        Done _     -> Done ()
+        Skip s'    -> Skip (s',0)
+        Yield s' a -> Yield (s',0) a
+
+    step' (s,n') = step s <&> \case
+        Done _     -> Done ()
+        Skip s'    -> Skip (s',n')
+        Yield s' a -> Yield (s',n'-1) a
+{-# INLINE_FUSED dropS #-}
 
 concatS :: Monad m => Stream (Stream a m r) m r -> Stream a m r
-concatS (Stream xs i) =
-    Stream (\case Left  s       -> xs s >>= go Nothing
-                  Right (st, t) -> go (Just t) st)
-           (Left `liftM` i)
+concatS (Stream step i) = Stream step' (Left i)
   where
-    go _ (Done r) = return $ Done r
-    go _ (Skip s) = return $ Skip (Left s)
+    {-# INLINE_INNER step' #-}
+    step' (Left s) = step s >>= \case
+        Done r     -> return $ Done r
+        Skip s'    -> return $ Skip (Left s')
+        Yield s' a -> step' (Right (s',a))
 
-    go Nothing e@(Yield _ z)              = go (Just z) e
-    go (Just (Stream ys j)) e@(Yield s _) = go' `liftM` (j >>= ys)
-      where
-        go' (Done _)    = Skip (Left s)
-        go' (Skip s')   = Skip (Right (e, Stream ys (return s')))
-        go' (Yield s' a) = Yield (Right (e, Stream ys (return s'))) a
-{-# SPECIALIZE concatS :: Stream (Stream a IO r) IO r -> Stream a IO r #-}
+    step' (Right (s, Stream inner j)) = inner j <&> \case
+        Done _     -> Skip (Left s)
+        Skip j'    -> Skip (Right (s, Stream inner j'))
+        Yield j' a -> Yield (Right (s, Stream inner j')) a
+{-# INLINE_FUSED concatS #-}
 
 fromList :: Foldable f => Applicative m => f a -> Stream a m ()
-fromList = Stream (\case []     -> pure $ Done ()
-                         (x:xs) -> pure $ Yield xs x) . pure . toList
-{-# INLINE fromList #-}
+fromList = Stream (pure . step) . toList
+  where
+    {-# INLINE_INNER step #-}
+    step []     = Done ()
+    step (x:xs) = Yield xs x
+{-# INLINE_FUSED fromList #-}
 
 fromListM :: (Monad m, Foldable f) => m (f a) -> Stream a m ()
-fromListM xs = Stream (\case []     -> return $ Done ()
-                             (y:ys) -> return $ Yield ys y)
-                      (toList `liftM` xs)
-{-# INLINE fromListM #-}
-
-runEffect :: Monad m => Stream a m r -> m r
-runEffect (Stream f i) = i >>= f >>= go
+fromListM = Stream (step `liftM`) . liftM toList
   where
-    go (Done r)    = return r
-    go (Skip s)    = f s >>= go
-    go (Yield s _) = f s >>= go
-{-# INLINE runEffect #-}
+    {-# INLINE_INNER step #-}
+    step []     = Done ()
+    step (y:ys) = Yield (return ys) y
+{-# INLINE_FUSED fromListM #-}
+
+runStream :: Monad m => Stream a m r -> m r
+runStream (Stream step i) = step' i
+  where
+    {-# INLINE_INNER step' #-}
+    step' s = step s >>= \case
+        Done r     -> return r
+        Skip s'    -> step' s'
+        Yield s' _ -> step' s'
+{-# INLINE_FUSED runStream #-}
+
+runStream_ :: Monad m => Stream Void m r -> m r
+runStream_ (Stream step i) = step' i
+  where
+    {-# INLINE_INNER step' #-}
+    step' s = step s >>= \case
+        Done r    -> return r
+        Skip s'   -> step' s'
+        Yield _ a -> absurd a
+{-# INLINE_FUSED runStream_ #-}
 
 toListS :: Monad m => Stream a m r -> m [a]
-toListS (Stream f i) = i >>= f >>= go
+toListS (Stream step i) = step' i
   where
-    go (Done _)   = return []
-    go (Skip s)    = f s >>= go
-    go (Yield s a) = f s >>= liftM (a:) . go
-{-# INLINE toListS #-}
+    {-# INLINE_INNER step' #-}
+    step' s = step s >>= \case
+        Done _     -> return []
+        Skip s'    -> step' s'
+        Yield s' a -> liftM (a:) (step' s')
+{-# INLINE_FUSED toListS #-}
 
 lazyToListS :: Stream a IO r -> IO [a]
-lazyToListS (Stream f i) = i >>= f >>= go
+lazyToListS (Stream step i) = step' i
   where
-    go (Done _)   = return []
-    go (Skip s)    = f s >>= go
-    go (Yield s a) = f s >>= liftM (a:) . unsafeInterleaveIO . go
-{-# INLINE lazyToListS #-}
+    {-# INLINE_INNER step' #-}
+    step' s = step s >>= \case
+        Done _     -> return []
+        Skip s'    -> step' s'
+        Yield s' a -> liftM (a:) (unsafeInterleaveIO (step' s'))
+{-# INLINE_FUSED lazyToListS #-}
 
 emptyStream :: (Monad m, Applicative m) => Stream Void m ()
 emptyStream = pure ()
-{-# INLINE emptyStream #-}
+{-# INLINE CONLIKE emptyStream #-}
 
-bracketS :: (Monad m, MonadMask m, MonadSafe m)
+bracketS :: (Monad m, MonadMask (Base m), MonadSafe m)
          => Base m s
          -> (s -> Base m ())
-         -> (forall r. s -> (a -> s -> m r) -> (s -> m r) -> m r -> m r)
+         -> (forall r. s -> (s -> a -> m r) -> (s -> m r) -> m r -> m r)
          -> Stream a m ()
-bracketS i f step = Stream go $ mask $ \_unmask -> do
-    s   <- liftBase i
+bracketS i f step = Stream step' $ mask $ \unmask -> do
+    s   <- unmask $ liftBase i
     key <- register (f s)
     return (s, key)
   where
-    go (s, key) =
-        step s (\a s' -> return $ Yield (s', key) a)
-               (\s'   -> return $ Skip (s', key))
-               (release key >> (const (Done ()) `liftM` liftBase (f s)))
-{-
-{-# SPECIALIZE bracketS
-      :: IO s
-      -> (s -> IO ())
-      -> (forall r. s -> (a -> s -> SafeT IO r)
-           -> (s -> SafeT IO r)
-           -> SafeT IO r
-           -> SafeT IO r)
-      -> Stream a (SafeT IO) () #-}
--}
+    {-# INLINE_INNER step' #-}
+    step' mx = mx >>= \(s, key) -> step s
+        (\s' a -> return $ Yield (return (s', key)) a)
+        (\s'   -> return $ Skip  (return (s', key)))
+        (mask $ \unmask -> do
+              unmask $ liftBase $ f s
+              release key
+              return $ Done ())
+{-# INLINE_FUSED bracketS #-}
 
 next :: Monad m => Stream a m r -> m (Either r (a, Stream a m r))
-next (Stream xs i) = do
-    s <- i
-    x <- xs s
-    case x of
+next (Stream step i) = step' i
+  where
+    {-# INLINE_INNER step' #-}
+    step' s = step s >>= \case
         Done r     -> return $ Left r
-        Skip s'    -> next (Stream xs (return s'))
-        Yield s' a -> return $ Right (a, Stream xs (return s'))
-{-# SPECIALIZE next :: Stream a IO r -> IO (Either r (a, Stream a IO r)) #-}
+        Skip s'    -> step' s'
+        Yield s' a -> return $ Right (a, Stream step s')
+{-# INLINE_FUSED next #-}
 
 -- ListT
 
