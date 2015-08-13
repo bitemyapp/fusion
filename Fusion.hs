@@ -7,6 +7,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE RecursiveDo #-}
 {-# LANGUAGE TupleSections #-}
 
 module Fusion
@@ -16,16 +17,18 @@ module Fusion
     -- * StepList
     , StepList(..)
     -- * Stream
-    , Stream(..), map, filter, drop, take, concat, linesUnbounded
+    , Stream(..), yield, await, stateful
+    , map, filter, drop, take, concat, linesUnbounded
     , runStream, runStream', bindStream, applyStream, stepStream
     , foldlStream, foldlStreamM
     , foldrStream, foldrStreamM, lazyFoldrStreamIO
     , fromList, fromListM, toListM, lazyToListIO
     , emptyStream, next
+    -- * Streaming with files
     , bracketS, streamFile
-    -- * StreamList
+    -- * ListT
     , ListT(..), concatL
-    -- * Pipes
+    -- * Pipes workalike functions
     , Producer, Pipe, Consumer {-, pipe-}
     , each
     , (>->), (>&>)
@@ -37,10 +40,12 @@ import           Control.Concurrent.Async.Lifted
 import           Control.Concurrent.STM
 import           Control.Monad
 import           Control.Monad.Catch
+import           Control.Monad.Fix
 import           Control.Monad.IO.Class
 import           Control.Monad.Trans.Class
 import           Control.Monad.Trans.Control
 import           Control.Monad.Trans.Free
+import           Control.Monad.Trans.State
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.Foldable as F
@@ -91,11 +96,14 @@ instance Show a => Show (Stream a Identity r) where
 
 instance Functor m => Functor (Stream a m) where
     {-# SPECIALIZE instance Functor (Stream a IO) #-}
+    {-# SPECIALIZE instance Functor m => Functor (Stream a (StateT s m)) #-}
+    {-# SPECIALIZE instance Functor (Stream a (StateT s IO)) #-}
     fmap f (Stream k m) = Stream (fmap (fmap f) . k) m
     {-# INLINE_FUSED fmap #-}
 
 instance (Monad m, Applicative m) => Applicative (Stream a m) where
     {-# SPECIALIZE instance Applicative (Stream a IO) #-}
+    {-# SPECIALIZE instance Applicative (Stream a (StateT s IO)) #-}
     pure = Stream (pure . Done)
     {-# INLINE_FUSED pure #-}
     sf <*> sx = Stream (\() -> Done <$> (runStream sf <*> runStream sx)) ()
@@ -103,20 +111,25 @@ instance (Monad m, Applicative m) => Applicative (Stream a m) where
 
 instance (Monad m, Applicative m) => Monad (Stream a m) where
     {-# SPECIALIZE instance Monad (Stream a IO) #-}
+    {-# SPECIALIZE instance Monad (Stream a (StateT s IO)) #-}
     return = Stream (return . Done)
     {-# INLINE_FUSED return #-}
-    Stream step i >>= f = Stream step' (i, Nothing)
+    Stream step i >>= f = Stream step' (Left i)
       where
         {-# INLINE_INNER step' #-}
-        step' (s, Nothing) = step s >>= \case
-            Done r     -> step' (s, Just (f r))
-            Skip s'    -> return $ Skip (s', Nothing)
-            Yield s' a -> return $ Yield (s', Nothing) a
+        step' (Left s) = step s >>= \case
+            Done r     -> case f r of
+                Stream step'' s'' -> step'' s'' <&> \case
+                    Done r'    -> Done r'
+                    Skip s'    -> Skip (Right (Stream step'' s'))
+                    Yield s' a -> Yield (Right (Stream step'' s')) a
+            Skip s'    -> return $ Skip (Left s')
+            Yield s' a -> return $ Yield (Left s') a
 
-        step' (old, Just (Stream step'' s)) = step'' s <&> \case
+        step' (Right (Stream step'' s)) = step'' s <&> \case
             Done r     -> Done r
-            Skip s'    -> Skip (old, Just (Stream step'' s'))
-            Yield s' a -> Yield (old, Just (Stream step'' s')) a
+            Skip s'    -> Skip (Right (Stream step'' s'))
+            Yield s' a -> Yield (Right (Stream step'' s')) a
     {-# INLINE_FUSED (>>=) #-}
 
 instance MonadThrow m => MonadThrow (Stream a m) where
@@ -188,6 +201,14 @@ stepStream :: Functor m
            -> Stream b m r
 stepStream f (Stream step i) = Stream (fmap f . step) i
 {-# INLINE_INNER stepStream #-}
+
+yield :: Applicative m => a -> Stream a m ()
+yield a = Stream (pure . step') True
+  where
+    {-# INLINE_INNER step' #-}
+    step' True  = Yield False a
+    step' False = Done ()
+{-# INLINE_FUSED yield #-}
 
 -- | Map over the values produced by a stream.
 --
@@ -433,8 +454,8 @@ emptyStream = pure ()
 bracketS :: (Monad m, MonadMask (Base m), MonadSafe m)
          => Base m s
          -> (s -> Base m ())
-         -> (forall r. s -> (s -> a -> m r) -> (s -> m r) -> m r -> m r)
-         -> Stream a m ()
+         -> (forall t. s -> (s -> a -> m t) -> (s -> m t) -> (r -> m t) -> m t)
+         -> Stream a m r
 bracketS i f step = Stream step' $ mask $ \unmask -> do
     s   <- unmask $ liftBase i
     key <- register (f s)
@@ -444,10 +465,10 @@ bracketS i f step = Stream step' $ mask $ \unmask -> do
     step' mx = mx >>= \(s, key) -> step s
         (\s' a -> return $ Yield (return (s', key)) a)
         (\s'   -> return $ Skip  (return (s', key)))
-        (mask $ \unmask -> do
+        (\r -> mask $ \unmask -> do
               unmask $ liftBase $ f s
               release key
-              return $ Done ())
+              return $ Done r)
 {-# INLINE_FUSED bracketS #-}
 
 streamFile :: (MonadIO m, MonadMask (Base m), MonadSafe m)
@@ -455,11 +476,11 @@ streamFile :: (MonadIO m, MonadMask (Base m), MonadSafe m)
 streamFile path = bracketS
     (liftIO $ openFile path ReadMode)
     (liftIO . hClose)
-    (\h yield _skip done -> do
+    (\h yield' _skip done -> do
           b <- liftIO $ hIsEOF h
           if b
-              then done
-              else yield h =<< liftIO (B.hGetSome h 8192))
+              then done ()
+              else yield' h =<< liftIO (B.hGetSome h 8192))
 {-# SPECIALIZE streamFile :: FilePath -> Stream ByteString (SafeT IO) () #-}
 
 next :: Monad m => Stream a m r -> m (Either r (a, Stream a m r))
@@ -502,20 +523,20 @@ concatL = ListT . concat . getListT . liftM getListT
 -- Pipes
 
 type Producer   b m r = Stream b m r
-type Pipe     a b m r = Stream a m r -> Stream b m r
-type Consumer a   m r = Stream a m () -> m r
+type Pipe     a b m r = forall s. Stream a m s -> Stream b m r
+type Consumer a   m r = forall s. Stream a m s -> m r
 
 each :: (Applicative m, F.Foldable f) => f a -> Producer a m ()
 each = fromList
 {-# INLINE_FUSED each #-}
 
-(>->) :: Stream a m r -> (Stream a m r -> Stream b m r) -> Stream b m r
+(>->) :: Stream a m s -> (Stream a m s -> Stream b m r) -> Stream b m r
 f >-> g = g f
 {-# INLINE_FUSED (>->) #-}
 
 {-
-pipe :: Monad m => P.Proxy () a () b m r -> Pipe a b m r
-pipe p0 (Stream step i) = Stream step' (i, p0)
+fromProxy :: Monad m => P.Proxy () a () b m r -> Pipe a b m r
+fromProxy p0 (Stream step i) = Stream step' (i, p0)
   where
     step' (s, p) = case p of
         P.Request () fa -> step s >>= \case
@@ -525,100 +546,41 @@ pipe p0 (Stream step i) = Stream step' (i, p0)
         P.Respond b  f_ -> return $ Yield (s, f_ ()) b
         P.M       m     -> m >>= \p' -> step' (s, p')
         P.Pure    r     -> return $ Done r
-{-# INLINE_FUSED pipe #-}
+{-# INLINE_FUSED fromProxy #-}
 -}
 
-{-
-newtype Pipe a b m r = Pipe { pipe :: Stream a m () -> Stream b m r }
-    deriving Functor
-
-instance Monad m => Applicative (Pipe a b m) where
-    pure  = return
-    {-# INLINE pure  #-}
-    (<*>) = ap
-    {-# INLINE (<*>)  #-}
-
-{-
-foo = do
-    x <- await
-    yield (x + 10)
-    yield (x + 20)
-    yield (x + 30)
-    y <- await
-    yield (y + 100)
-    z <- await
-    yield (z + 1000)
-    foo
--}
-
-foo :: Applicative m => Stream Int m r -> Stream Int m r
-foo (Stream step i) = Stream step' (Left i, 0 :: Int)
+stateful :: MonadFix m
+         => Stream a (StateT (Stream a m s) m) r -> Stream a m s -> Stream a m r
+stateful (Stream inner x) outer = Stream step' (x, outer)
   where
     {-# INLINE_INNER step' #-}
-    step' (Right (s, [x]),  n) = pure $ Yield (Left s, n) x
-    step' (Right (s, x:xs), n) = pure $ Yield (Right (s, xs), n) x
-
-    step' (Left s, 0) = step s <&> \case
-        Done r     -> Done r
-        Skip s'    -> Skip (Left s', 0)
-        Yield s' x -> Yield (Right (s', [x + 20, x + 30]), 1) (x + 10)
-
-    step' (Left s, 1) = step s <&> \case
-        Done r     -> Done r
-        Skip s'    -> Skip (Left s', 1)
-        Yield s' y -> Yield (Left s', 2) (y + 100)
-
-    step' (Left s, 2) = step s <&> \case
-        Done r     -> Done r
-        Skip s'    -> Skip (Left s', 2)
-        Yield s' z -> Yield (Left s', 0) (z + 1000)
-{-# INLINE foo #-}
-
-instance Monad m => Monad (Pipe a b m) where
-    return x = Pipe $ \_ -> pure x
-    {-# INLINE return #-}
-    Pipe p >>= f = Pipe $ \(Stream step i) -> Stream (step' step) i
+    step' (t, str) = mdo
+        (r, str') <- runStateT (go str') str
+        return r
       where
-        {-# INLINE_INNER step' #-}
-        step' step s = step s >>= \case
-            Done r     -> _
-                -- let Pipe g = f r in
-                -- case g undefined of
-                --     Stream step'' i'' -> step'' s >>= \case
-                --         Done r     -> Done r
-                --         Skip s'    -> pure $ Skip s'
-                --         Yield s' a -> _
-            Skip s'    -> pure $ Skip s'
-            Yield s' a -> pure $ Yield s' a
-    {-# INLINE (>>=) #-}
+        {-# INLINE_INNER go #-}
+        go str' = inner t <&> \case
+            Done r     -> Done r
+            Skip t'    -> Skip (t', str')
+            Yield t' a -> Yield (t', str') a
+{-# INLINE_FUSED stateful #-}
 
-await :: Functor m => Pipe a b m a
-await = Pipe $ \(Stream step i) -> Stream (step' step) i
+await :: Monad m => Stream a (StateT (Stream a m s) m) (Maybe a)
+await = Stream step' ()
   where
-    step' step s = step s <&> \case
-        Done r     -> error "Upstream has ended"
-        Skip s'    -> Skip s'
-        Yield s' x -> Done x
-
-yield :: Applicative m => b -> Pipe a b m ()
-yield b = Pipe $ \_ ->
-    Stream (\case True  -> pure (Yield False b)
-                  False -> pure (Done ())) True
--}
+    {-# INLINE_INNER step' #-}
+    step' () = get >>= \case
+        Stream step s -> lift (step s) >>= \case
+            Done _    -> return $ Done Nothing
+            Skip s'   -> do
+                put (Stream step s')
+                return $ Skip ()
+            Yield s' a -> do
+                put (Stream step s')
+                return $ Done (Just a)
+{-# INLINE_FUSED await #-}
 
 {-
-bar :: Monad m => P.Proxy () Int () Int m r
-bar = do
-    x <- P.await
-    P.yield (x + 10)
-    P.yield (x + 20)
-    P.yield (x + 30)
-    y <- P.await
-    P.yield (y + 100)
-    z <- P.await
-    P.yield (z + 1000)
-    bar
-
 main :: IO ()
 main = do
     xs <- toListM $ take 10 $ pipe bar $ each ([1..1000] :: [Int])
