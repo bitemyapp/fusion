@@ -16,13 +16,13 @@ module Fusion
     -- * StepList
     , StepList(..)
     -- * Stream
-    , Stream(..), map, filter, drop, take, concat, lines
+    , Stream(..), map, filter, drop, take, concat, linesUnbounded
     , runStream, runStream', bindStream, applyStream, stepStream
     , foldlStream, foldlStreamM
     , foldrStream, foldrStreamM, lazyFoldrStreamIO
     , fromList, fromListM, toListM, lazyToListIO
     , emptyStream, next
-    , bracket, streamFile
+    , bracketS, streamFile
     -- * StreamList
     , ListT(..), concatL
     -- * Pipes
@@ -33,10 +33,10 @@ module Fusion
     where
 
 import           Control.Applicative
-import           Control.Concurrent hiding (yield)
 import           Control.Concurrent.Async.Lifted
 import           Control.Concurrent.STM
 import           Control.Monad
+import           Control.Monad.Catch
 import           Control.Monad.IO.Class
 import           Control.Monad.Trans.Class
 import           Control.Monad.Trans.Control
@@ -51,7 +51,7 @@ import qualified Data.Text as T
 --import qualified Data.Text.Encoding as T
 import           Data.Void
 import           GHC.Exts hiding (fromList, toList)
-import           Pipes.Safe (SafeT, MonadSafe(..), MonadMask(..))
+import           Pipes.Safe (SafeT, MonadSafe(..))
 import           Prelude hiding (map, concat, filter, take, drop, lines)
 import           System.IO
 import           System.IO.Unsafe
@@ -100,6 +100,68 @@ instance (Monad m, Applicative m) => Applicative (Stream a m) where
     {-# INLINE_FUSED pure #-}
     sf <*> sx = Stream (\() -> Done <$> (runStream sf <*> runStream sx)) ()
     {-# INLINE_FUSED (<*>) #-}
+
+instance (Monad m, Applicative m) => Monad (Stream a m) where
+    {-# SPECIALIZE instance Monad (Stream a IO) #-}
+    return = Stream (return . Done)
+    {-# INLINE_FUSED return #-}
+    Stream step i >>= f = Stream step' (i, Nothing)
+      where
+        {-# INLINE_INNER step' #-}
+        step' (s, Nothing) = step s >>= \case
+            Done r     -> step' (s, Just (f r))
+            Skip s'    -> return $ Skip (s', Nothing)
+            Yield s' a -> return $ Yield (s', Nothing) a
+
+        step' (old, Just (Stream step'' s)) = step'' s <&> \case
+            Done r     -> Done r
+            Skip s'    -> Skip (old, Just (Stream step'' s'))
+            Yield s' a -> Yield (old, Just (Stream step'' s')) a
+    {-# INLINE_FUSED (>>=) #-}
+
+instance MonadThrow m => MonadThrow (Stream a m) where
+    throwM e = Stream (\_ -> throwM e) ()
+    {-# INLINE_FUSED throwM #-}
+
+instance MonadCatch m => MonadCatch (Stream a m) where
+    catch (Stream step i) c = Stream step' (i, Nothing)
+      where
+        {-# INLINE_INNER step' #-}
+        step' (s, Nothing) = go `catch` \e -> step' (s, Just (c e))
+          where
+            {-# INLINE_INNER go #-}
+            go = step s <&> \case
+                Done r     -> Done r
+                Skip s'    -> Skip (s', Nothing)
+                Yield s' a -> Yield (s', Nothing) a
+
+        step' (old, Just (Stream step'' s)) = step'' s <&> \case
+            Done r     -> Done r
+            Skip s'    -> Skip (old, Just (Stream step'' s'))
+            Yield s' a -> Yield (old, Just (Stream step'' s')) a
+    {-# INLINE_FUSED catch #-}
+-- #if MIN_VERSION_exceptions(0,6,0)
+
+instance MonadMask m => MonadMask (Stream a m) where
+-- #endif
+    mask action = Stream step' Nothing
+      where
+        step' Nothing = mask $ \unmask ->
+            step' $ Just $ action $ \(Stream step s) -> Stream (unmask . step) s
+        step' (Just (Stream step'' i'')) = step'' i'' <&> \case
+            Done r     -> Done r
+            Skip s'    -> Skip (Just (Stream step'' s'))
+            Yield s' a -> Yield (Just (Stream step'' s')) a
+    {-# INLINE mask #-}
+    uninterruptibleMask action = Stream step' Nothing
+      where
+        step' Nothing = mask $ \unmask ->
+            step' $ Just $ action $ \(Stream step s) -> Stream (unmask . step) s
+        step' (Just (Stream step'' i'')) = step'' i'' <&> \case
+            Done r     -> Done r
+            Skip s'    -> Skip (Just (Stream step'' s'))
+            Yield s' a -> Yield (Just (Stream step'' s')) a
+    {-# INLINEABLE uninterruptibleMask #-}
 
 instance MonadTrans (Stream a) where
     lift = Stream (Done `liftM`)
@@ -231,7 +293,7 @@ linesUnbounded (Stream step i) = Stream step' (Left (i, id))
 
 lines :: (Monad m, Functor f)
       => (FreeT (Stream Text m) m r -> f (FreeT (Stream Text m) m r))
-      -> (Stream Text m r -> f (Stream Text m r))
+      -> Stream Text m r -> f (Stream Text m r)
 lines k p = fmap _unlines (k (_lines p))
 {-# INLINE lines #-}
 
@@ -368,12 +430,12 @@ emptyStream :: (Monad m, Applicative m) => Stream Void m ()
 emptyStream = pure ()
 {-# INLINE CONLIKE emptyStream #-}
 
-bracket :: (Monad m, MonadMask (Base m), MonadSafe m)
+bracketS :: (Monad m, MonadMask (Base m), MonadSafe m)
          => Base m s
          -> (s -> Base m ())
          -> (forall r. s -> (s -> a -> m r) -> (s -> m r) -> m r -> m r)
          -> Stream a m ()
-bracket i f step = Stream step' $ mask $ \unmask -> do
+bracketS i f step = Stream step' $ mask $ \unmask -> do
     s   <- unmask $ liftBase i
     key <- register (f s)
     return (s, key)
@@ -386,11 +448,11 @@ bracket i f step = Stream step' $ mask $ \unmask -> do
               unmask $ liftBase $ f s
               release key
               return $ Done ())
-{-# INLINE_FUSED bracket #-}
+{-# INLINE_FUSED bracketS #-}
 
 streamFile :: (MonadIO m, MonadMask (Base m), MonadSafe m)
            => FilePath -> Stream ByteString m ()
-streamFile path = bracket
+streamFile path = bracketS
     (liftIO $ openFile path ReadMode)
     (liftIO . hClose)
     (\h yield _skip done -> do
