@@ -6,6 +6,7 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MagicHash #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecursiveDo #-}
 {-# LANGUAGE TupleSections #-}
@@ -18,7 +19,7 @@ module Fusion
     , StepList(..)
     -- * Stream
     , Stream(..), yield, await, stateful
-    , map, filter, drop, take, concat, linesUnbounded
+    , map, filter, drop, take, concat, linesUnbounded, lines
     , runStream, runStream', bindStream, applyStream, stepStream
     , foldlStream, foldlStreamM
     , foldrStream, foldrStreamM, lazyFoldrStreamIO
@@ -282,6 +283,13 @@ concat (Stream step i) = Stream step' (Left i)
 -- decodeUtf8 :: Applicative m => Stream ByteString m r -> Stream Text m ()
 -- decodeUtf8 = Stream step' (i, Pass n)
 
+-- | Break the stream of input 'Text' chunks into a stream of lines. This is
+-- called 'linesUnbounded' because memory utilization is not bounded, and will
+-- take up as many bytes as the longest line. For static space usage, please
+-- use 'lines'.
+--
+-- >>> toListM $ yield "Hello, world!\nGoodbye" >-> linesUnbounded
+-- ["Hello, world!","Goodbye"]
 linesUnbounded :: Applicative m => Stream Text m r -> Stream Text m r
 linesUnbounded (Stream step i) = Stream step' (Left (i, id))
   where
@@ -312,6 +320,13 @@ linesUnbounded (Stream step i) = Stream step' (Left (i, id))
                             (T.concat (prev [x]))
 {-# INLINE_FUSED linesUnbounded #-}
 
+-- | A perfect streaming approach to breaking up input into lines, using the
+-- 'FreeT' monad transformer to produce a stream of streams. (Do not use
+-- 'retractT' in production code, since this results in the same behavior as
+-- 'linesUnbounded').
+--
+-- >>> toListM $ retractT (yield "Hello, world!\nGoodbye" ^. lines)
+-- ["Hello, world!","Goodbye"]
 lines :: (Monad m, Functor f)
       => (FreeT (Stream Text m) m r -> f (FreeT (Stream Text m) m r))
       -> Stream Text m r -> f (Stream Text m r)
@@ -327,15 +342,29 @@ _lines (Stream step i) = FreeT (go (step i))
           Yield s' a ->
               if T.null a
               then go (step s')
-              else let (a',b') = T.break (== '\n') a in
-                   return $ Free $ Stream step' s'
-      step' = undefined
+              else return $ Free $ Stream step' (s', Right a)
+
+      step' (s, Left a) =
+          return $ Done $ FreeT $ return $ Free $ Stream step' (s, Right a)
+
+      step' (s, Right "") = step s >>= \case
+          Done  r    -> return $ Done $ FreeT $ return $ Pure r
+          Skip  s'   -> return $ Skip (s', Right "")
+          Yield s' a -> step' (s', Right a)
+
+      step' (s, Right a) = do
+          let (a',b') = T.break (== '\n') a
+          if T.null b'
+              then return $ Yield (s, Right b') a'
+              else return $ Yield (s, Left (T.drop 1 b')) a'
 {-# INLINABLE _lines #-}
 
 _unlines :: Monad m => FreeT (Stream Text m) m r -> Stream Text m r
 -- _unlines = concat . map (<* return (T.singleton '\n'))
 _unlines = undefined
 {-# INLINABLE _unlines #-}
+
+-- takeFree :: (Functor f, Monad m) => Int -> FreeT f m () -> FreeT f m ()
 
 fromList :: (F.Foldable f, Applicative m) => f a -> Stream a m ()
 fromList = Stream (pure . step) . F.toList
@@ -568,7 +597,7 @@ stateful (Stream inner x) outer = Stream step' (x, outer)
 await :: Monad m => Stream a (StateT (Stream a m s) m) (Maybe a)
 await = Stream step' ()
   where
-    {-# INLINE_INNER step' #-}
+    {-# INLINEABLE [0] step' #-}
     step' () = get >>= \case
         Stream step s -> lift (step s) >>= \case
             Done _    -> return $ Done Nothing
@@ -579,13 +608,6 @@ await = Stream step' ()
                 put (Stream step s')
                 return $ Done (Just a)
 {-# INLINE_FUSED await #-}
-
-{-
-main :: IO ()
-main = do
-    xs <- toListM $ take 10 $ pipe bar $ each ([1..1000] :: [Int])
-    print xs
--}
 
 -- | Connect two streams, but gather elements from upstream in a separate
 -- thread. Exceptions raised in that thread are propagated back to the main
@@ -612,4 +634,4 @@ Stream step i >&> k = k $ Stream step' $ do
     step' s = s >>= \q -> liftIO (atomically (readTBQueue q)) <&> \case
         Left r  -> Done r
         Right a -> Yield (return q) a
-{-# INLINE_FUSED (>&>) #-}
+{-# INLINEABLE [1] (>&>) #-}
