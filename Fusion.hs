@@ -16,40 +16,48 @@ module Fusion
     -- * StepList
     , StepList(..)
     -- * Stream
-    , Stream(..), map, filter, drop, concat, lines
-    , fromList, fromListM
+    , Stream(..), map, filter, drop, take, concat, lines
     , runStream, runStream', bindStream, applyStream, stepStream
     , foldlStream, foldlStreamM
     , foldrStream, foldrStreamM, lazyFoldrStreamIO
-    , toListM, lazyToListIO
+    , fromList, fromListM, toListM, lazyToListIO
     , emptyStream, next
     , bracket, streamFile
     -- * StreamList
     , ListT(..), concatL
     -- * Pipes
-    , Producer, Pipe, Consumer
+    , Producer, Pipe, Consumer {-, pipe-}
     , each
-    , (>->)
+    , (>->), (>&>)
     )
     where
 
 import           Control.Applicative
+import           Control.Concurrent hiding (yield)
+import           Control.Concurrent.Async.Lifted
+import           Control.Concurrent.STM
 import           Control.Monad
 import           Control.Monad.IO.Class
 import           Control.Monad.Trans.Class
+import           Control.Monad.Trans.Control
+import           Control.Monad.Trans.Free
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.Foldable as F
+import           Data.Function
 import           Data.Functor.Identity
 import           Data.Text (Text)
 import qualified Data.Text as T
-import qualified Data.Text.Encoding as T
+--import qualified Data.Text.Encoding as T
 import           Data.Void
 import           GHC.Exts hiding (fromList, toList)
 import           Pipes.Safe (SafeT, MonadSafe(..), MonadMask(..))
-import           Prelude hiding (map, concat, filter, drop, lines)
+import           Prelude hiding (map, concat, filter, take, drop, lines)
 import           System.IO
 import           System.IO.Unsafe
+
+-- import qualified Pipes as P
+-- import qualified Pipes.Internal as P
 
 #define PHASE_FUSED [1]
 #define PHASE_INNER [0]
@@ -162,6 +170,17 @@ drop (I# n) (Stream step i) = Stream step' (i, Pass n)
         Done r     -> Done r
 {-# INLINE_FUSED drop #-}
 
+take :: Applicative m => Int -> Stream a m r -> Stream a m ()
+take n (Stream step i) = Stream step' (i, n)
+  where
+    {-# INLINE_INNER step' #-}
+    step' (_, 0)  = pure $ Done ()
+    step' (s, n') = step s <&> \case
+        Yield s' a -> Yield (s', n' - 1) a
+        Skip  s'   -> Skip (s', n')
+        Done  _    -> Done ()
+{-# INLINE_FUSED take #-}
+
 concat :: Monad m => Stream (Stream a m r) m r -> Stream a m r
 concat (Stream step i) = Stream step' (Left i)
   where
@@ -180,8 +199,8 @@ concat (Stream step i) = Stream step' (Left i)
 -- decodeUtf8 :: Applicative m => Stream ByteString m r -> Stream Text m ()
 -- decodeUtf8 = Stream step' (i, Pass n)
 
-lines :: Applicative m => Stream Text m r -> Stream Text m r
-lines (Stream step i) = Stream step' (Left (i, id))
+linesUnbounded :: Applicative m => Stream Text m r -> Stream Text m r
+linesUnbounded (Stream step i) = Stream step' (Left (i, id))
   where
     -- Right means we have pending lines to emit, followed by either the next
     -- state, or the end.
@@ -208,7 +227,32 @@ lines (Stream step i) = Stream step' (Left (i, id))
             --     everything that was queued (s')
             (x:xs) -> Yield (Right (Left (s', (last xs:)), init xs))
                             (T.concat (prev [x]))
-{-# INLINE_FUSED lines #-}
+{-# INLINE_FUSED linesUnbounded #-}
+
+lines :: (Monad m, Functor f)
+      => (FreeT (Stream Text m) m r -> f (FreeT (Stream Text m) m r))
+      -> (Stream Text m r -> f (Stream Text m r))
+lines k p = fmap _unlines (k (_lines p))
+{-# INLINE lines #-}
+
+_lines :: Monad m => Stream Text m r -> FreeT (Stream Text m) m r
+_lines (Stream step i) = FreeT (go (step i))
+    where
+      go p = p >>= \case
+          Done  r    -> return $ Pure r
+          Skip  s'   -> go (step s')
+          Yield s' a ->
+              if T.null a
+              then go (step s')
+              else let (a',b') = T.break (== '\n') a in
+                   return $ Free $ Stream step' s'
+      step' = undefined
+{-# INLINABLE _lines #-}
+
+_unlines :: Monad m => FreeT (Stream Text m) m r -> Stream Text m r
+-- _unlines = concat . map (<* return (T.singleton '\n'))
+_unlines = undefined
+{-# INLINABLE _unlines #-}
 
 fromList :: (F.Foldable f, Applicative m) => f a -> Stream a m ()
 fromList = Stream (pure . step) . F.toList
@@ -396,7 +440,7 @@ concatL = ListT . concat . getListT . liftM getListT
 -- Pipes
 
 type Producer   b m r = Stream b m r
-type Pipe     a b m r = Stream a m () -> Stream b m r
+type Pipe     a b m r = Stream a m r -> Stream b m r
 type Consumer a   m r = Stream a m () -> m r
 
 each :: (Applicative m, F.Foldable f) => f a -> Producer a m ()
@@ -406,3 +450,142 @@ each = fromList
 (>->) :: Stream a m r -> (Stream a m r -> Stream b m r) -> Stream b m r
 f >-> g = g f
 {-# INLINE_FUSED (>->) #-}
+
+{-
+pipe :: Monad m => P.Proxy () a () b m r -> Pipe a b m r
+pipe p0 (Stream step i) = Stream step' (i, p0)
+  where
+    step' (s, p) = case p of
+        P.Request () fa -> step s >>= \case
+            Done r     -> return $ Done r
+            Skip s'    -> return $ Skip (s', p)
+            Yield s' a -> step' (s', fa a)
+        P.Respond b  f_ -> return $ Yield (s, f_ ()) b
+        P.M       m     -> m >>= \p' -> step' (s, p')
+        P.Pure    r     -> return $ Done r
+{-# INLINE_FUSED pipe #-}
+-}
+
+{-
+newtype Pipe a b m r = Pipe { pipe :: Stream a m () -> Stream b m r }
+    deriving Functor
+
+instance Monad m => Applicative (Pipe a b m) where
+    pure  = return
+    {-# INLINE pure  #-}
+    (<*>) = ap
+    {-# INLINE (<*>)  #-}
+
+{-
+foo = do
+    x <- await
+    yield (x + 10)
+    yield (x + 20)
+    yield (x + 30)
+    y <- await
+    yield (y + 100)
+    z <- await
+    yield (z + 1000)
+    foo
+-}
+
+foo :: Applicative m => Stream Int m r -> Stream Int m r
+foo (Stream step i) = Stream step' (Left i, 0 :: Int)
+  where
+    {-# INLINE_INNER step' #-}
+    step' (Right (s, [x]),  n) = pure $ Yield (Left s, n) x
+    step' (Right (s, x:xs), n) = pure $ Yield (Right (s, xs), n) x
+
+    step' (Left s, 0) = step s <&> \case
+        Done r     -> Done r
+        Skip s'    -> Skip (Left s', 0)
+        Yield s' x -> Yield (Right (s', [x + 20, x + 30]), 1) (x + 10)
+
+    step' (Left s, 1) = step s <&> \case
+        Done r     -> Done r
+        Skip s'    -> Skip (Left s', 1)
+        Yield s' y -> Yield (Left s', 2) (y + 100)
+
+    step' (Left s, 2) = step s <&> \case
+        Done r     -> Done r
+        Skip s'    -> Skip (Left s', 2)
+        Yield s' z -> Yield (Left s', 0) (z + 1000)
+{-# INLINE foo #-}
+
+instance Monad m => Monad (Pipe a b m) where
+    return x = Pipe $ \_ -> pure x
+    {-# INLINE return #-}
+    Pipe p >>= f = Pipe $ \(Stream step i) -> Stream (step' step) i
+      where
+        {-# INLINE_INNER step' #-}
+        step' step s = step s >>= \case
+            Done r     -> _
+                -- let Pipe g = f r in
+                -- case g undefined of
+                --     Stream step'' i'' -> step'' s >>= \case
+                --         Done r     -> Done r
+                --         Skip s'    -> pure $ Skip s'
+                --         Yield s' a -> _
+            Skip s'    -> pure $ Skip s'
+            Yield s' a -> pure $ Yield s' a
+    {-# INLINE (>>=) #-}
+
+await :: Functor m => Pipe a b m a
+await = Pipe $ \(Stream step i) -> Stream (step' step) i
+  where
+    step' step s = step s <&> \case
+        Done r     -> error "Upstream has ended"
+        Skip s'    -> Skip s'
+        Yield s' x -> Done x
+
+yield :: Applicative m => b -> Pipe a b m ()
+yield b = Pipe $ \_ ->
+    Stream (\case True  -> pure (Yield False b)
+                  False -> pure (Done ())) True
+-}
+
+{-
+bar :: Monad m => P.Proxy () Int () Int m r
+bar = do
+    x <- P.await
+    P.yield (x + 10)
+    P.yield (x + 20)
+    P.yield (x + 30)
+    y <- P.await
+    P.yield (y + 100)
+    z <- P.await
+    P.yield (z + 1000)
+    bar
+
+main :: IO ()
+main = do
+    xs <- toListM $ take 10 $ pipe bar $ each ([1..1000] :: [Int])
+    print xs
+-}
+
+-- | Connect two streams, but gather elements from upstream in a separate
+-- thread. Exceptions raised in that thread are propagated back to the main
+-- thread. A bounded buffer is used of 16 elements.
+--
+-- Note that monadic effects from upstream are discarded. This is acceptable
+-- if effects propagate beyond the thread, such as in 'IO', but does prevent
+-- 'StateT' changes from being seen downstream, for example.
+(>&>) :: (MonadBaseControl IO m, MonadIO m, MonadMask m)
+      => Stream a m r -> (Stream a m r -> Stream b m r) -> Stream b m r
+Stream step i >&> k = k $ Stream step' $ do
+    q <- liftIO $ newTBQueueIO 16
+    mask $ \unmask -> do
+        a <- unmask $ async $ flip fix i $ \loop s -> step s >>= \case
+            Done r     -> liftIO $ atomically $ writeTBQueue q (Left r)
+            Skip s'    -> loop s'
+            Yield s' a -> do
+                liftIO $ atomically $ writeTBQueue q (Right a)
+                loop s'
+        link a
+    return q
+  where
+    {-# INLINE_INNER step' #-}
+    step' s = s >>= \q -> liftIO (atomically (readTBQueue q)) <&> \case
+        Left r  -> Done r
+        Right a -> Yield (return q) a
+{-# INLINE_FUSED (>&>) #-}
