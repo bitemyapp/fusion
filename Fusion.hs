@@ -59,6 +59,7 @@ import           Data.Void
 import           GHC.Exts hiding (fromList, toList)
 import           Pipes.Safe (SafeT, MonadSafe(..))
 import           Prelude hiding (map, concat, filter, take, drop, lines)
+import qualified Prelude
 import           System.IO
 import           System.IO.Unsafe
 #if DOCTESTS
@@ -364,7 +365,7 @@ _unlines = undefined
 
 -- takeFree :: (Functor f, Monad m) => Int -> FreeT f m () -> FreeT f m ()
 
-fromList :: (F.Foldable f, Applicative m) => f a -> Stream a m ()
+fromList :: (Applicative m, F.Foldable f) => f a -> Stream a m ()
 fromList = Stream (pure . step) . F.toList
   where
     {-# INLINE_INNER step #-}
@@ -462,7 +463,7 @@ toListM (Stream step i) = step' i id
         Done _     -> return $ acc []
         Skip s'    -> step' s' acc
         Yield s' a -> step' s' (acc . (a:))
-{-# INLINE toListM #-}
+{-# INLINE [1] toListM #-}
 
 lazyToListIO :: Stream a IO r -> IO [a]
 lazyToListIO (Stream step i) = step' i
@@ -624,3 +625,22 @@ Stream step i >&> k = k $ Stream step' $ do
 
 {-# RULES "fusion: map/map" forall f g xs.
       map f (map g xs) = map (f . g) xs #-}
+
+{-
+
+These four rules together, on a simple pipline, improve speed dramatically.
+But if the fourth doesn't fire (which it won't, except for trivial examples),
+then it makes the pipeline twice as slow.
+
+{-# RULES "fusion: map/each" forall f xs.
+      map f (each xs) = each (Prelude.map f xs) #-}
+
+{-# RULES "fusion: filter/each" forall f xs.
+      filter f (each xs) = each (Prelude.filter f xs) #-}
+
+{-# RULES "fusion: drop/each" forall n xs.
+      drop n (each xs) = each (Prelude.drop n xs) #-}
+
+{-# RULES "fusion: toListM/each" forall xs.
+      toListM (each xs) = return xs #-}
+-}
