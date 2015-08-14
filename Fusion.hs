@@ -26,7 +26,7 @@ module Fusion
     , fromList, fromListM, toListM, lazyToListIO
     , emptyStream, next
     -- * Streaming with files
-    , bracketS, streamFile
+    , bracketS, readFile, writeFile
     -- * ListT
     , ListT(..), concatL
     -- * Pipes workalike functions
@@ -58,9 +58,10 @@ import qualified Data.Text as T
 import           Data.Void
 import           GHC.Exts hiding (fromList, toList)
 import           Pipes.Safe (SafeT, MonadSafe(..))
-import           Prelude hiding (map, concat, filter, take, drop, lines)
+import           Prelude hiding (map, concat, filter, take, drop, lines,
+                                 readFile, writeFile)
 import qualified Prelude
-import           System.IO
+import           System.IO hiding (readFile, writeFile)
 import           System.IO.Unsafe
 #if DOCTESTS
 import           Control.Lens ((^.))
@@ -499,9 +500,9 @@ bracketS i f step = Stream step' $ mask $ \unmask -> do
               return $ Done r)
 {-# INLINE_FUSED bracketS #-}
 
-streamFile :: (MonadIO m, MonadMask (Base m), MonadSafe m)
-           => FilePath -> Stream ByteString m ()
-streamFile path = bracketS
+readFile :: (MonadIO m, MonadMask (Base m), MonadSafe m)
+         => FilePath -> Stream ByteString m ()
+readFile path = bracketS
     (liftIO $ openFile path ReadMode)
     (liftIO . hClose)
     (\h yield' _skip done -> do
@@ -509,7 +510,18 @@ streamFile path = bracketS
           if b
               then done ()
               else yield' h =<< liftIO (B.hGetSome h 8192))
-{-# SPECIALIZE streamFile :: FilePath -> Stream ByteString (SafeT IO) () #-}
+{-# SPECIALIZE readFile :: FilePath -> Stream ByteString (SafeT IO) () #-}
+
+writeFile :: (MonadIO m, MonadMask (Base m), MonadSafe m)
+          => FilePath -> Stream ByteString m () -> m ()
+writeFile path s = mask $ \unmask -> do
+    h <- unmask $ liftIO $ openFile path WriteMode
+    key <- register (liftIO $ hClose h)
+    unmask $ foldrStreamM (\a _ -> liftIO $ B.hPut h a) (\() -> return ()) s
+    liftIO $ hClose h
+    release key
+{-# SPECIALIZE writeFile
+      :: FilePath -> Stream ByteString (SafeT IO) () -> SafeT IO () #-}
 
 next :: Monad m => Stream a m r -> m (Either r (a, Stream a m r))
 next (Stream step i) = step' i
