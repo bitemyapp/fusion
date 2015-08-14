@@ -61,9 +61,9 @@ import           Pipes.Safe (SafeT, MonadSafe(..))
 import           Prelude hiding (map, concat, filter, take, drop, lines)
 import           System.IO
 import           System.IO.Unsafe
-
--- import qualified Pipes as P
--- import qualified Pipes.Internal as P
+#if DOCTESTS
+import           Control.Lens ((^.))
+#endif
 
 #define PHASE_FUSED [1]
 #define PHASE_INNER [0]
@@ -105,10 +105,10 @@ instance Functor m => Functor (Stream a m) where
 instance (Monad m, Applicative m) => Applicative (Stream a m) where
     {-# SPECIALIZE instance Applicative (Stream a IO) #-}
     {-# SPECIALIZE instance Applicative (Stream a (StateT s IO)) #-}
-    pure = Stream (pure . Done)
-    {-# INLINE_FUSED pure #-}
-    sf <*> sx = Stream (\() -> Done <$> (runStream sf <*> runStream sx)) ()
-    {-# INLINE_FUSED (<*>) #-}
+    pure = return
+    {-# INLINE pure #-}
+    (<*>) = ap
+    {-# INLINE (<*>) #-}
 
 instance (Monad m, Applicative m) => Monad (Stream a m) where
     {-# SPECIALIZE instance Monad (Stream a IO) #-}
@@ -119,19 +119,19 @@ instance (Monad m, Applicative m) => Monad (Stream a m) where
       where
         {-# INLINE_INNER step' #-}
         step' (Left s) = step s >>= \case
-            Done r     -> case f r of
-                Stream step'' s'' -> step'' s'' <&> \case
-                    Done r'    -> Done r'
-                    Skip s'    -> Skip (Right (Stream step'' s'))
-                    Yield s' a -> Yield (Right (Stream step'' s')) a
+            Done r     -> switchStream (f r)
             Skip s'    -> return $ Skip (Left s')
             Yield s' a -> return $ Yield (Left s') a
-
-        step' (Right (Stream step'' s)) = step'' s <&> \case
-            Done r     -> Done r
-            Skip s'    -> Skip (Right (Stream step'' s'))
-            Yield s' a -> Yield (Right (Stream step'' s')) a
+        step' (Right s) = switchStream s
     {-# INLINE_FUSED (>>=) #-}
+
+switchStream :: Functor m
+             => Stream a m r -> m (Step (Either s (Stream a m r)) a r)
+switchStream (Stream step i) = step i <&> \case
+    Done r     -> Done r
+    Skip s'    -> Skip (Right (Stream step s'))
+    Yield s' a -> Yield (Right (Stream step s')) a
+{-# INLINE_INNER switchStream #-}
 
 instance MonadThrow m => MonadThrow (Stream a m) where
     throwM e = Stream (\_ -> throwM e) ()
@@ -154,10 +154,10 @@ instance MonadCatch m => MonadCatch (Stream a m) where
             Skip s'    -> Skip (old, Just (Stream step'' s'))
             Yield s' a -> Yield (old, Just (Stream step'' s')) a
     {-# INLINE_FUSED catch #-}
--- #if MIN_VERSION_exceptions(0,6,0)
+#if MIN_VERSION_exceptions(0,6,0)
 
 instance MonadMask m => MonadMask (Stream a m) where
--- #endif
+#endif
     mask action = Stream step' Nothing
       where
         step' Nothing = mask $ \unmask ->
@@ -288,7 +288,7 @@ concat (Stream step i) = Stream step' (Left i)
 -- take up as many bytes as the longest line. For static space usage, please
 -- use 'lines'.
 --
--- >>> toListM $ yield "Hello, world!\nGoodbye" >-> linesUnbounded
+-- >>> toListM $ yield (T.pack "Hello, world!\nGoodbye") >-> linesUnbounded
 -- ["Hello, world!","Goodbye"]
 linesUnbounded :: Applicative m => Stream Text m r -> Stream Text m r
 linesUnbounded (Stream step i) = Stream step' (Left (i, id))
@@ -325,7 +325,7 @@ linesUnbounded (Stream step i) = Stream step' (Left (i, id))
 -- 'retractT' in production code, since this results in the same behavior as
 -- 'linesUnbounded').
 --
--- >>> toListM $ retractT (yield "Hello, world!\nGoodbye" ^. lines)
+-- >>> toListM $ retractT (yield (T.pack "Hello, world!\nGoodbye") ^. lines)
 -- ["Hello, world!","Goodbye"]
 lines :: (Monad m, Functor f)
       => (FreeT (Stream Text m) m r -> f (FreeT (Stream Text m) m r))
@@ -561,22 +561,7 @@ each = fromList
 
 (>->) :: Stream a m s -> (Stream a m s -> Stream b m r) -> Stream b m r
 f >-> g = g f
-{-# INLINE_FUSED (>->) #-}
-
-{-
-fromProxy :: Monad m => P.Proxy () a () b m r -> Pipe a b m r
-fromProxy p0 (Stream step i) = Stream step' (i, p0)
-  where
-    step' (s, p) = case p of
-        P.Request () fa -> step s >>= \case
-            Done r     -> return $ Done r
-            Skip s'    -> return $ Skip (s', p)
-            Yield s' a -> step' (s', fa a)
-        P.Respond b  f_ -> return $ Yield (s, f_ ()) b
-        P.M       m     -> m >>= \p' -> step' (s, p')
-        P.Pure    r     -> return $ Done r
-{-# INLINE_FUSED fromProxy #-}
--}
+{-# INLINE (>->) #-}
 
 stateful :: MonadFix m
          => Stream a (StateT (Stream a m s) m) r -> Stream a m s -> Stream a m r
@@ -635,3 +620,9 @@ Stream step i >&> k = k $ Stream step' $ do
         Left r  -> Done r
         Right a -> Yield (return q) a
 {-# INLINEABLE [1] (>&>) #-}
+
+{-# RULES "fusion: drop/map" forall f n xs.
+      drop n (map f xs) = map f (drop n xs) #-}
+
+{-# RULES "fusion: map/map" forall f g xs.
+      map f (map g xs) = map (f . g) xs #-}
