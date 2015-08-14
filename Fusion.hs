@@ -154,10 +154,8 @@ instance MonadCatch m => MonadCatch (Stream a m) where
             Skip s'    -> Skip (old, Just (Stream step'' s'))
             Yield s' a -> Yield (old, Just (Stream step'' s')) a
     {-# INLINE_FUSED catch #-}
-#if MIN_VERSION_exceptions(0,6,0)
 
 instance MonadMask m => MonadMask (Stream a m) where
-#endif
     mask action = Stream step' Nothing
       where
         step' Nothing = mask $ \unmask ->
